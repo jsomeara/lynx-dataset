@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+data/hg38.fa
+data/hg38.fa.fai
+data/hg38.fa.gz
+
+raw_data
+shards.jsonl
+LYNX_DATASET
+
+slurm_logs
+.lynx_slurm
