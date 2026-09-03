@@ -49,8 +49,10 @@ uv run build_shards_jsonl.py \
 
 If you don't have slurm cluster, you should be able to easily reverse engineer this to run without slurm.
 
-```
+```bash
 bash launch_shards.sh \
   --account stf \
   --partition compute
 ```
+
+Please check if there's any remaining partial files in the LYNX_DATASET. If there is, then run the launch shards script again and it will attempt to resume what's missing.

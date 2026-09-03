@@ -15,8 +15,8 @@ Designed for SLURM:
   - Handles SIGTERM/SIGUSR1/SIGINT by finishing the current batch, closing
     the HDF5 cleanly, then exiting with code 99.
   - Final output is created only by atomic rename after all batches finish.
-  - If a partial HDF5 cannot be opened, the script fails loudly rather than
-    silently overwriting it.
+  - Existing partial checkpoints are write-probed in a child process.
+    Structurally corrupted partials are quarantined and rebuilt automatically.
 
 Preprocessing
 -------------
@@ -84,6 +84,7 @@ import json
 import math
 import re
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -574,6 +575,70 @@ def validate_partial_h5(
         ) from e
 
 
+def probe_partial_h5_writeability(partial_path: Path) -> tuple[bool, str]:
+    """Probe an existing checkpoint's next HDF5 write in a child process."""
+    probe_code = """
+import sys
+import h5py
+import numpy as np
+
+path = sys.argv[1]
+with h5py.File(path, 'r+') as h5:
+    bc = np.asarray(h5['batch_complete'][:], dtype=np.uint8)
+    incomplete = np.flatnonzero(bc == 0)
+    batch_size = int(h5.attrs['track_batch_size'])
+    n_tracks = h5['targets'].shape[2]
+    if incomplete.size:
+        batch_index = int(incomplete[0])
+    else:
+        batch_index = max(0, len(bc) - 1)
+    t0 = batch_index * batch_size
+    t1 = min(n_tracks, t0 + batch_size)
+    if t0 >= n_tracks:
+        raise RuntimeError('checkpoint probe computed invalid track range')
+    bp1 = min(4096, h5['targets'].shape[1])
+    block = h5['targets'][0, :bp1, t0:t1]
+    h5['targets'][0, :bp1, t0:t1] = block
+    h5.flush()
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, '-c', probe_code, str(partial_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:
+        return False, f'checkpoint write probe timed out after {e.timeout}s'
+
+    if result.returncode == 0:
+        return True, ''
+
+    detail = (result.stderr or result.stdout or '').strip()
+    if len(detail) > 4000:
+        detail = detail[-4000:]
+    return False, (
+        f'checkpoint write probe failed with exit code {result.returncode}'
+        + (f'\n{detail}' if detail else '')
+    )
+
+
+def quarantine_corrupt_partial(partial_path: Path) -> Path:
+    """Move a bad checkpoint aside so a fresh one can be created safely."""
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    base = partial_path.name
+    if base.endswith('.partial.h5'):
+        base = base[:-len('.partial.h5')]
+    candidate = partial_path.with_name(f'{base}.corrupt-{stamp}.h5')
+    suffix = 1
+    while candidate.exists():
+        candidate = partial_path.with_name(f'{base}.corrupt-{stamp}-{suffix}.h5')
+        suffix += 1
+    partial_path.replace(candidate)
+    return candidate
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -732,6 +797,38 @@ def main():
     unmappable = read_bed(args.unmappable)
 
     # -------------------------------------------------------
+    # Validate/probe an existing checkpoint before resuming.
+    # -------------------------------------------------------
+
+    if partial_path.exists():
+        print("Existing checkpoint found; validating for resume...")
+        validate_partial_h5(
+            partial_path,
+            shard_id,
+            args.split,
+            windows,
+            tracks,
+            args.track_batch_size,
+        )
+        print("Checkpoint metadata is compatible; probing HDF5 writeability...")
+        probe_ok, probe_detail = probe_partial_h5_writeability(partial_path)
+
+        if not probe_ok:
+            print()
+            print("[checkpoint] existing partial is NOT safely writable.")
+            print("[checkpoint] likely damaged by an earlier hard kill or filesystem write failure.")
+            if probe_detail:
+                print("[checkpoint] probe diagnostic:")
+                for line in probe_detail.splitlines():
+                    print(f"    {line}")
+            quarantined = quarantine_corrupt_partial(partial_path)
+            print(f"[checkpoint] quarantined corrupt file as: {quarantined}")
+            print("[checkpoint] rebuilding this shard from scratch.")
+            print()
+        else:
+            print("Checkpoint is compatible and writeable.")
+
+    # -------------------------------------------------------
     # Create checkpoint if needed.
     # -------------------------------------------------------
 
@@ -791,17 +888,7 @@ def main():
 
         print("Checkpoint created.")
 
-    else:
-        print("Existing checkpoint found; validating for resume...")
-        validate_partial_h5(
-            partial_path,
-            shard_id,
-            args.split,
-            windows,
-            tracks,
-            args.track_batch_size,
-        )
-        print("Checkpoint is compatible.")
+    # Existing healthy checkpoints were already validated/probed above.
 
     # Load the mask once into RAM.
     with h5py.File(partial_path, "r") as h5:
